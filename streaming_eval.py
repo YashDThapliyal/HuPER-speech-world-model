@@ -2,7 +2,7 @@
 streaming_eval.py
 Phase 8 — Streaming HuPER Encoder: evaluation vs offline oracle.
 
-For each of 8 LibriSpeech utterances, compares:
+For each of N LibriSpeech utterances, compares:
   E_offline : (T, 256)  full-context WavLM, full utterance (oracle)
   E_stream  : (T', 256) windowed WavLM, causal or bounded-lookahead
 
@@ -30,6 +30,8 @@ Usage
   python streaming_eval.py
   python streaming_eval.py --n_utt 4     # faster
   python streaming_eval.py --chunk 160   # smaller chunks
+
+Note: for polished figures and the full findings writeup, run make_phase8_report.py.
 """
 
 from __future__ import annotations
@@ -39,16 +41,12 @@ import sys
 import time
 from pathlib import Path
 
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoFeatureExtractor, WavLMModel
 import librosa
-
-matplotlib.use("Agg")
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 from huper_features import EvidenceProjector
@@ -58,38 +56,7 @@ from streaming_encoder import (
     WAVLM_ID, TARGET_SR, D_RAW, D_PROJ, FRAME_STRIDE,
 )
 
-# ── paths ─────────────────────────────────────────────────────────────────────
-ROOT_DIR   = Path(__file__).parent
-FIG_DIR    = ROOT_DIR / "data" / "figures_phase8"
-CACHE_DIR  = ROOT_DIR / "data" / "cache"
-SAMPLE_WAV = ROOT_DIR / "data" / "samples" / "librispeech_sample.wav"
-
-DARK_BG  = "#0e1117"
-PANEL_BG = "#1a1d23"
-SPINE_C  = "#333333"
-TICK_C   = "#666666"
-TEXT_C   = "#cccccc"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Styling helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _style_ax(ax: plt.Axes, title: str = "", xlabel: str = "", ylabel: str = "") -> None:  # type: ignore[name-defined]
-    ax.set_facecolor(PANEL_BG)
-    ax.tick_params(colors=TICK_C)
-    ax.spines[:].set_color(SPINE_C)
-    if title:  ax.set_title(title, color="white", fontsize=10, pad=6)
-    if xlabel: ax.set_xlabel(xlabel, color=TEXT_C, fontsize=9)
-    if ylabel: ax.set_ylabel(ylabel, color=TEXT_C, fontsize=9)
-
-
-def _save(fig: plt.Figure, name: str) -> None:  # type: ignore[name-defined]
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
-    out = FIG_DIR / name
-    fig.savefig(out, dpi=150, facecolor=DARK_BG)
-    plt.close(fig)
-    print(f"  Saved → {out.name}")
+ROOT_DIR = Path(__file__).parent
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,11 +64,8 @@ def _save(fig: plt.Figure, name: str) -> None:  # type: ignore[name-defined]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_utterances(n: int) -> list[dict]:
-    """
-    Stream first n utterances from LibriSpeech validation split.
-    Returns list of dicts: {id, waveform, sr, text, duration_s}.
-    """
-    print(f"  Streaming LibriSpeech validation [first {n} utterances] …")
+    """Stream first n utterances from LibriSpeech validation split."""
+    print(f"  Streaming LibriSpeech validation [first {n} utterances]…")
     ds = load_dataset(
         "librispeech_asr", "clean", split="validation",
         streaming=True, trust_remote_code=True,
@@ -115,16 +79,14 @@ def load_utterances(n: int) -> list[dict]:
         sr    = int(audio["sampling_rate"])
         if sr != TARGET_SR:
             wav = librosa.resample(wav, orig_sr=sr, target_sr=TARGET_SR)
-            sr  = TARGET_SR
         items.append({
             "id":         f"val_{i:04d}",
             "waveform":   wav,
-            "sr":         sr,
+            "sr":         TARGET_SR,
             "text":       item.get("text", ""),
-            "duration_s": len(wav) / sr,
+            "duration_s": len(wav) / TARGET_SR,
         })
-        if (i + 1) % 4 == 0:
-            print(f"    loaded {i+1}/{n} …")
+    print(f"  Loaded {len(items)} utterances")
     return items
 
 
@@ -133,28 +95,21 @@ def load_utterances(n: int) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def eval_utterance(
-    item:        dict,
-    encoder:     StreamingHuPEREncoder,
-    cfg:         StreamingConfig,
-    E_offline:   np.ndarray,             # (T, 256) oracle
+    item:      dict,
+    encoder:   StreamingHuPEREncoder,
+    cfg:       StreamingConfig,
+    E_offline: np.ndarray,   # (T, 256) oracle
 ) -> dict:
-    """
-    Run streaming encoder on one utterance and compute alignment metrics.
-
-    Returns a dict with all per-utterance results.
-    """
+    """Run streaming encoder on one utterance and return alignment metrics."""
     waveform      = item["waveform"]
     duration_s    = item["duration_s"]
     chunk_samples = cfg.chunk_samples
     n_chunks      = int(np.ceil(len(waveform) / chunk_samples))
 
     encoder.reset()
-
-    # Push audio chunk by chunk
     t0 = time.perf_counter()
     for i in range(n_chunks):
-        chunk = waveform[i * chunk_samples : (i + 1) * chunk_samples]
-        encoder.push_audio(chunk)
+        encoder.push_audio(waveform[i * chunk_samples : (i + 1) * chunk_samples])
     encoder.flush()
     wall_s = time.perf_counter() - t0
 
@@ -225,230 +180,6 @@ def _empty_result(utt_id: str, cfg: StreamingConfig, dur: float, wall: float) ->
         "cos_per_frame": np.array([]), "n_chunks": 0, "chunk_frames": 0,
         "E_stream": np.empty((0, D_PROJ)), "E_offline": np.empty((0, D_PROJ)),
     }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Visualizations
-# ─────────────────────────────────────────────────────────────────────────────
-
-COLORS = {
-    0:   "#4fc3f7",   # causal — blue
-    40:  "#81c784",   # 40ms   — green
-    80:  "#ffd740",   # 80ms   — amber
-    160: "#ff7043",   # 160ms  — orange
-}
-LABELS = {0: "causal (0ms)", 40: "look-40ms", 80: "look-80ms", 160: "look-160ms"}
-
-
-def viz8_1_frame_similarity(
-    results_by_la: dict[int, dict],
-    utt_id:        str,
-    chunk_frames:  int,
-) -> None:
-    """Viz 8-1 — Framewise cosine similarity vs offline, one utterance."""
-    fig, ax = plt.subplots(figsize=(16, 5), facecolor=DARK_BG)
-    fig.suptitle(
-        f"Viz 8-1 — Streaming vs Offline Framewise Cosine  [{utt_id}]",
-        color="white", fontsize=12, fontweight="bold",
-    )
-
-    for la, res in sorted(results_by_la.items()):
-        cos = res["cos_per_frame"]
-        if len(cos) == 0:
-            continue
-        t = np.arange(len(cos)) * FRAME_STRIDE / TARGET_SR
-        ax.plot(t, cos, color=COLORS[la], lw=0.8, alpha=0.85,
-                label=f"{LABELS[la]}  μ={res['mean_cos']:.3f}")
-
-    # Mark chunk boundaries
-    ref_res = next(iter(results_by_la.values()))
-    T_total = ref_res["T_cmp"]
-    dur_s   = T_total * FRAME_STRIDE / TARGET_SR
-    for i in range(1, ref_res["n_chunks"] + 1):
-        t_bound = i * chunk_frames * FRAME_STRIDE / TARGET_SR
-        if t_bound < dur_s:
-            ax.axvline(t_bound, color="#444444", lw=0.6, linestyle="--", alpha=0.7)
-
-    ax.axhline(1.0, color=SPINE_C, lw=0.5, linestyle=":")
-    ax.set_xlim(0, dur_s)
-    ax.set_ylim(-0.1, 1.05)
-    ax.legend(fontsize=8, framealpha=0.3, facecolor=PANEL_BG,
-              labelcolor="white", edgecolor=SPINE_C)
-    _style_ax(ax, xlabel="Time (s)", ylabel="Cosine similarity to oracle")
-    ax.text(0.99, 0.04, "dashed = chunk boundaries",
-            transform=ax.transAxes, color="#666666", fontsize=7, ha="right")
-
-    _save(fig, "viz8_1_frame_similarity.png")
-
-
-def viz8_2_latency_quality(agg: dict[int, dict]) -> None:
-    """Viz 8-2 — Latency vs quality trade-off across streaming modes."""
-    la_vals    = sorted(agg.keys())
-    mean_cos   = [agg[la]["mean_cos_mean"]  for la in la_vals]
-    latencies  = [agg[la]["latency_ms"]     for la in la_vals]
-    rtf_vals   = [agg[la]["rtf_mean"]       for la in la_vals]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5), facecolor=DARK_BG,
-                                    gridspec_kw={"wspace": 0.35})
-    fig.suptitle("Viz 8-2 — Latency / Quality Trade-off",
-                 color="white", fontsize=12, fontweight="bold")
-
-    # Left: quality vs lookahead
-    colors_list = [COLORS[la] for la in la_vals]
-    bars1 = ax1.bar(np.arange(len(la_vals)), mean_cos, color=colors_list, width=0.55)
-    ax1.set_xticks(np.arange(len(la_vals)))
-    ax1.set_xticklabels([f"{la}ms" for la in la_vals], color=TEXT_C, fontsize=9)
-    ax1.set_ylim(0, 1.05)
-    for bar, v in zip(bars1, mean_cos):
-        ax1.text(bar.get_x() + bar.get_width() / 2, v + 0.01,
-                 f"{v:.3f}", ha="center", va="bottom", color="white", fontsize=8)
-    _style_ax(ax1, title="Feature quality vs lookahead",
-              xlabel="Right lookahead (ms)", ylabel="Mean cosine to oracle")
-
-    # Right: latency + RTF
-    x = np.arange(len(la_vals))
-    ax2.bar(x - 0.2, latencies, color=colors_list, width=0.35, label="Latency (ms)")
-    ax2r = ax2.twinx()
-    ax2r.plot(x, rtf_vals, color="#ce93d8", marker="o", lw=1.5, ms=6, label="RTF")
-    ax2r.set_ylim(0, max(rtf_vals) * 1.5)
-    ax2r.tick_params(colors=TICK_C)
-    ax2r.set_ylabel("Real-time factor", color=TEXT_C, fontsize=9)
-    ax2r.spines[:].set_color(SPINE_C)
-    ax2.set_xticks(x)
-    ax2.set_xticklabels([f"{la}ms" for la in la_vals], color=TEXT_C, fontsize=9)
-    _style_ax(ax2, title="Latency and RTF vs lookahead",
-              xlabel="Right lookahead (ms)", ylabel="Algorithmic latency (ms)")
-
-    _save(fig, "viz8_2_latency_quality.png")
-
-
-def viz8_3_feature_heatmap(res_causal: dict, res_la160: dict) -> None:
-    """Viz 8-3 — Feature heatmap: offline / streaming / absolute difference."""
-    E_off  = res_causal["E_offline"]    # (T_cmp, 256)
-    E_c    = res_causal["E_stream"]     # (T_cmp, 256)
-    E_la   = res_la160["E_stream"]      # (T_cmp2, 256)
-    T      = min(E_off.shape[0], E_c.shape[0], E_la.shape[0], 200)
-
-    Eo, Ec, El = E_off[:T].T, E_c[:T].T, E_la[:T].T   # (256, T)
-    diff_c  = np.abs(Eo - Ec)
-    diff_la = np.abs(Eo - El)
-
-    vmin, vmax = np.percentile(Eo, 2), np.percentile(Eo, 98)
-    dmax = max(float(diff_c.max()), float(diff_la.max()), 1e-6)
-
-    fig, axes = plt.subplots(4, 1, figsize=(16, 14), facecolor=DARK_BG,
-                             gridspec_kw={"hspace": 0.45})
-    fig.suptitle("Viz 8-3 — Feature Heatmap Comparison  (first 200 frames)",
-                 color="white", fontsize=12, fontweight="bold")
-
-    def _imshow(ax: plt.Axes, data: np.ndarray, title: str,  # type: ignore[name-defined]
-                cmap: str, vn: float, vx: float) -> None:
-        ax.imshow(data, aspect="auto", origin="lower", cmap=cmap,
-                  vmin=vn, vmax=vx, interpolation="nearest",
-                  extent=(0, T * FRAME_STRIDE / TARGET_SR, 0, 256))
-        _style_ax(ax, title=title, xlabel="Time (s)", ylabel="Dim")
-
-    _imshow(axes[0], Eo, "Offline oracle E_t (full context)", "RdBu_r", vmin, vmax)
-    _imshow(axes[1], Ec, f"Streaming causal (0ms lookahead)  μcos={res_causal['mean_cos']:.3f}",
-            "RdBu_r", vmin, vmax)
-    _imshow(axes[2], diff_c, "|offline − causal|", "hot", 0, dmax)
-    _imshow(axes[3], diff_la, f"|offline − 160ms lookahead|  μcos={res_la160['mean_cos']:.3f}",
-            "hot", 0, dmax)
-
-    _save(fig, "viz8_3_feature_heatmap.png")
-
-
-def viz8_4_boundary_zoom(res: dict) -> None:
-    """Viz 8-4 — Zoomed cosine similarity around several chunk boundaries."""
-    cos         = res["cos_per_frame"]    # (T_cmp,)
-    chunk_frames = res["chunk_frames"]
-    n_show      = 4
-    half        = 12   # frames on each side of boundary
-
-    if len(cos) < half * 2 or chunk_frames < 1:
-        return
-
-    # Pick up to n_show boundaries
-    boundaries = [i * chunk_frames for i in range(1, res["n_chunks"] + 1)
-                  if half < i * chunk_frames < len(cos) - half][:n_show]
-    if not boundaries:
-        return
-
-    n_cols = len(boundaries)
-    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 4), facecolor=DARK_BG,
-                             gridspec_kw={"wspace": 0.35})
-    if n_cols == 1:
-        axes = [axes]   # type: ignore[assignment]
-    fig.suptitle(
-        f"Viz 8-4 — Chunk Boundary Effect  [{res['utt_id']}  la={res['lookahead_ms']}ms]"
-        f"  boundary_drop={res['boundary_drop']:.4f}",
-        color="white", fontsize=11, fontweight="bold",
-    )
-
-    for ax, bf in zip(axes, boundaries):
-        lo, hi = bf - half, bf + half
-        x = np.arange(lo, hi)
-        ax.plot(x, cos[lo:hi], color=COLORS.get(res["lookahead_ms"], "#4fc3f7"),
-                lw=1.2, marker="o", ms=3)
-        ax.axvline(bf, color="#ff7043", lw=1.0, linestyle="--",
-                   label=f"boundary k={bf}")
-        ax.axhline(res["mean_cos"], color="white", lw=0.6, linestyle=":",
-                   label=f"mean={res['mean_cos']:.3f}")
-        ax.set_ylim(-0.1, 1.05)
-        ax.legend(fontsize=7, framealpha=0.3, facecolor=PANEL_BG,
-                  labelcolor="white", edgecolor=SPINE_C)
-        t_bound = bf * FRAME_STRIDE / TARGET_SR
-        _style_ax(ax, title=f"Boundary at t={t_bound:.2f}s",
-                  xlabel="Frame index", ylabel="Cosine to oracle")
-
-    _save(fig, "viz8_4_boundary_zoom.png")
-
-
-def viz8_5_aggregate(
-    agg:         dict[int, dict],
-    all_results: dict[int, list[dict]],
-) -> None:
-    """Viz 8-5 — Aggregate cosine per mode (boxplot) + RTF bar chart."""
-    la_vals = sorted(agg.keys())
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), facecolor=DARK_BG,
-                                    gridspec_kw={"wspace": 0.35})
-    fig.suptitle("Viz 8-5 — Aggregate Results Across Utterances",
-                 color="white", fontsize=12, fontweight="bold")
-
-    # Boxplot of per-utterance mean cosine for each mode
-    data_cos = [[r["mean_cos"] for r in all_results[la]] for la in la_vals]
-    bp = ax1.boxplot(
-        data_cos,
-        patch_artist=True,
-        medianprops=dict(color="white", lw=1.5),
-        whiskerprops=dict(color=SPINE_C),
-        capprops=dict(color=SPINE_C),
-        flierprops=dict(marker="o", color=SPINE_C, ms=4),
-    )
-    for patch, la in zip(bp["boxes"], la_vals):
-        patch.set_facecolor(COLORS[la])
-        patch.set_alpha(0.8)
-
-    ax1.set_xticks(np.arange(1, len(la_vals) + 1))
-    ax1.set_xticklabels([LABELS[la] for la in la_vals], color=TEXT_C, fontsize=8)
-    ax1.set_ylim(0, 1.05)
-    _style_ax(ax1, title="Cosine to oracle — distribution over utterances",
-              xlabel="Streaming mode", ylabel="Mean cosine (per utterance)")
-
-    # RTF bar chart
-    rtf_vals = [agg[la]["rtf_mean"] for la in la_vals]
-    colors_l  = [COLORS[la] for la in la_vals]
-    ax2.bar(np.arange(len(la_vals)), rtf_vals, color=colors_l, width=0.55)
-    ax2.axhline(1.0, color="white", lw=0.8, linestyle=":", label="RTF = 1 (real-time)")
-    ax2.set_xticks(np.arange(len(la_vals)))
-    ax2.set_xticklabels([LABELS[la] for la in la_vals], color=TEXT_C, fontsize=8)
-    ax2.legend(fontsize=8, framealpha=0.3, facecolor=PANEL_BG,
-               labelcolor="white", edgecolor=SPINE_C)
-    _style_ax(ax2, title="Real-time factor per mode  (< 1 = faster than real time)",
-              xlabel="Streaming mode", ylabel="RTF")
-
-    _save(fig, "viz8_5_aggregate.png")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -546,25 +277,6 @@ def run(n_utt: int, chunk_ms: int) -> None:
             "rtf_mean":       float(np.mean([r["rtf"]       for r in results])),
         }
 
-    # ── Visualizations ────────────────────────────────────────────────────────
-    print("\n--- Generating visualizations ---")
-
-    # Representative utterance = the first one
-    rep_utt     = utterances[0]
-    chunk_frames = configs[0].chunk_samples // FRAME_STRIDE
-
-    # Build per-la result dicts for the representative utterance
-    rep_by_la = {la: all_results[la][0] for la in sorted(all_results.keys())}
-
-    viz8_1_frame_similarity(rep_by_la, rep_utt["id"], chunk_frames)
-    viz8_2_latency_quality(agg)
-    viz8_3_feature_heatmap(
-        res_causal = all_results[0][0],
-        res_la160  = all_results[160][0],
-    )
-    viz8_4_boundary_zoom(all_results[0][0])   # causal mode for boundary zoom
-    viz8_5_aggregate(agg, all_results)
-
     # ── Print summary ─────────────────────────────────────────────────────────
     best_la  = max(agg.keys(), key=lambda la: agg[la]["mean_cos_mean"])
     worst_la = min(agg.keys(), key=lambda la: agg[la]["mean_cos_mean"])
@@ -594,7 +306,7 @@ def run(n_utt: int, chunk_ms: int) -> None:
           f"latency={agg[0]['latency_ms']:.0f}ms  cos={agg[0]['mean_cos_mean']:.4f}")
     print(f"  ├── Mean RTF (causal)          : {agg[0]['rtf_mean']:.3f}  "
           f"({'< 1 = real-time capable' if agg[0]['rtf_mean'] < 1 else '> 1 = slower than real-time'})")
-    print(f"  ├── Figures                   : {FIG_DIR}")
+    print(f"  └── For figures: run make_phase8_report.py")
     print()
 
     gain_160 = agg[160]["mean_cos_mean"] - agg[0]["mean_cos_mean"]
