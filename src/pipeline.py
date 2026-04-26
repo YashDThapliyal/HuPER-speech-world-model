@@ -37,6 +37,13 @@ from huper_features import EvidenceProjector                    # Phase 3
 from syllable_clock import detect_syllables, HOP_LENGTH         # Phase 4
 from slotizer import MeanPoolSlotizer, AttentionSlotizer        # Phase 5
 from belief_model import BeliefTransitionGRU                    # Phase 6
+from feature_sources import extract_streaming_features, FeatureBundle  # Phase 8 — streaming wiring
+from phone_ctc import (
+    PhoneCTCHead,
+    confidence_from_logits,
+    decode_logits_greedy,
+    ids_to_tokens,
+)
 
 matplotlib.use("Agg")
 
@@ -71,7 +78,7 @@ class PipelineResult:
     utt_id:      str
     waveform:    np.ndarray     # (N_samples,)
     sample_rate: int
-    layer24:     np.ndarray     # (T, 1024)  frozen WavLM features
+    layer24:     np.ndarray | None  # (T, 1024) frozen WavLM features — None in streaming mode
     E_t:         np.ndarray     # (T, 256)   projected evidence
     T:           int
     boundaries:  list[tuple[int, int]]   # K pairs of (start_frame, end_frame)
@@ -82,6 +89,12 @@ class PipelineResult:
     mismatch:    np.ndarray     # (K-1,)     1 − cosine(pred, target)
     durations_ms: np.ndarray    # (K,)       milliseconds per syllable slot
     pooling:     str            # "mean" | "attn"
+    phone_logits: np.ndarray | None = None      # (T, V) if phone mode enabled
+    phone_ids: np.ndarray | None = None         # (T,) argmax IDs per frame
+    phone_sequence_ids: np.ndarray | None = None  # (U,) CTC-collapsed IDs
+    phone_tokens: list[str] | None = None       # (T,) frame token strings
+    phone_sequence_tokens: list[str] | None = None  # (U,) collapsed token strings
+    phone_confidence: float | None = None
     metadata:    dict = field(default_factory=dict)
 
 
@@ -239,6 +252,8 @@ class SpeechWorldModelPipeline:
         projector:    EvidenceProjector,
         slotizer:     nn.Module,
         belief_model: BeliefTransitionGRU,
+        phone_head:   PhoneCTCHead | None       = None,
+        phone_meta:   dict | None               = None,
         pooling:      Literal["mean", "attn"] = "mean",
         device:       torch.device            = torch.device("cpu"),
         cache_dir:    Path                    = CACHE_DIR,
@@ -246,6 +261,8 @@ class SpeechWorldModelPipeline:
         self.projector    = projector.to(device)
         self.slotizer     = slotizer.to(device)
         self.belief_model = belief_model.to(device)
+        self.phone_head   = phone_head.to(device) if phone_head is not None else None
+        self.phone_meta   = phone_meta or {}
         self.pooling      = pooling
         self.device       = device
 
@@ -352,18 +369,36 @@ class SpeechWorldModelPipeline:
 
     def run_full(
         self,
-        audio_path: str | Path,
-        utt_id:     str | None = None,
-        pooling:    str | None = None,
+        audio_path:      str | Path,
+        utt_id:          str | None = None,
+        pooling:         str | None = None,
+        mode:            Literal["offline", "streaming"] = "offline",
+        chunk_ms:        int = 320,
+        left_context_ms: int = 640,
+        lookahead_ms:    int = 40,
+        enable_phone_mode: bool = False,
+        phone_blank_bias: float = 0.0,
+        phone_min_conf: float = 0.0,
     ) -> PipelineResult:
         """
         Complete pipeline: audio path → PipelineResult.
 
         Parameters
         ----------
-        audio_path : path to a 16kHz mono wav file
-        utt_id     : unique id used for caching (defaults to filename stem)
-        pooling    : "mean" | "attn"  (overrides self.pooling if given)
+        audio_path      : path to a 16kHz mono wav file
+        utt_id          : unique id used for caching (defaults to filename stem)
+        pooling         : "mean" | "attn"  (overrides self.pooling if given)
+        mode            : "offline" (default) — cached full-context WavLM + projector;
+                          "streaming" — pseudo-streaming windowed WavLM via
+                          feature_sources.extract_streaming_features; bypasses
+                          WavLMExtractor cache; returns layer24=None.
+        chunk_ms        : (streaming only) audio chunk size in ms (default 320)
+        left_context_ms : (streaming only) history window in ms (default 640)
+        lookahead_ms    : (streaming only) right-lookahead in ms (default 40)
+        enable_phone_mode: if True, decode frame-level phones from E_t using
+                           self.phone_head + self.phone_meta.
+        phone_blank_bias: add bias to blank logit before greedy decoding.
+        phone_min_conf  : if >0, force low-confidence frames to blank.
         """
         audio_path = Path(audio_path)
         if utt_id is None:
@@ -376,28 +411,107 @@ class SpeechWorldModelPipeline:
         print(f"\n[pipeline] {utt_id}")
         print(f"  audio        : {waveform.shape[0]/sr:.2f}s  ({waveform.shape[0]} samples @ {sr}Hz)")
 
-        # 2. Extract WavLM layer-24 features (cached)
-        layer24 = self._wavlm_extractor.extract(waveform, sr, utt_id)
-        T = layer24.shape[0]
-        log_shape("layer24", layer24)
+        # 2. Acoustic evidence extraction (branches on mode)
+        if mode == "offline":
+            # Offline path: cached WavLM layer-24 → EvidenceProjector (unchanged)
+            layer24 = self._wavlm_extractor.extract(waveform, sr, utt_id)
+            T = layer24.shape[0]
+            log_shape("layer24", layer24)
 
-        # 3. EvidenceProjector → E_t
-        x   = torch.from_numpy(layer24).to(self.device)
-        self.projector.eval()
-        with torch.no_grad():
-            E_t_tensor = self.projector(x)   # (T, 256)
-        E_t = E_t_tensor.cpu().numpy()
-        log_shape("E_t", E_t_tensor)
+            x = torch.from_numpy(layer24).to(self.device)
+            self.projector.eval()
+            with torch.no_grad():
+                E_t_tensor = self.projector(x)   # (T, 256)
+            E_t = E_t_tensor.cpu().numpy()
+            log_shape("E_t", E_t_tensor)
 
-        # 4. Syllable boundaries (cached)
-        boundaries = self._boundary_cache.get(waveform, sr, utt_id)
+            source_latency_ms = 0.0
+            source_wall_s     = 0.0
+            source_config: dict = {"mode": "offline"}
+        elif mode == "streaming":
+            # Streaming path: extract_streaming_features applies the projector
+            # internally, so we must NOT re-project here.
+            self._wavlm_extractor._ensure_loaded()   # force HF objects into memory
+            assert self._wavlm_extractor._wavlm is not None
+            assert self._wavlm_extractor._feat_extractor is not None
+            bundle: FeatureBundle = extract_streaming_features(
+                waveform           = waveform,
+                sr                 = sr,
+                projector          = self.projector,
+                wavlm_model        = self._wavlm_extractor._wavlm,
+                feat_extractor     = self._wavlm_extractor._feat_extractor,
+                device             = self.device,
+                chunk_ms           = chunk_ms,
+                left_context_ms    = left_context_ms,
+                right_lookahead_ms = lookahead_ms,
+            )
+            layer24    = None          # streaming never materialises (T, 1024)
+            E_t        = bundle.E_t   # (T, 256) numpy — already projected
+            E_t_tensor = torch.from_numpy(E_t).to(self.device)
+            T          = bundle.T
+            log_shape("E_t (streaming)", E_t_tensor)
+            source_latency_ms = bundle.latency_ms
+            source_wall_s     = bundle.wall_s
+            source_config     = bundle.config
+        else:
+            raise ValueError(
+                f"run_full(mode=...) must be 'offline' or 'streaming', got {mode!r}"
+            )
+
+        # 4. Syllable boundaries (cached) — clamp to actual T so streaming
+        # T_stream (±1-3 frames vs T_offline) never causes out-of-bounds slicing
+        raw_boundaries = self._boundary_cache.get(waveform, sr, utt_id)
+        boundaries = [
+            (s, min(e, T - 1))
+            for s, e in raw_boundaries
+            if s < T
+        ]
         K = len(boundaries)
-        print(f"  boundaries   : K={K}  ({K / (waveform.shape[0]/sr):.1f} Hz)")
+        print(f"  boundaries   : K={K}  ({K / (waveform.shape[0]/sr):.1f} Hz)  mode={mode}")
 
         # 5. Slotizer
         slots_tensor = self.build_slots(E_t_tensor, boundaries)   # (K, 256)
         slots = slots_tensor.cpu().numpy()
         log_shape("slots", slots_tensor)
+
+        # 5b. Optional phone mode: E_t -> phone logits -> greedy CTC decode
+        phone_logits_np: np.ndarray | None = None
+        phone_ids_np: np.ndarray | None = None
+        phone_seq_ids_np: np.ndarray | None = None
+        phone_tokens: list[str] | None = None
+        phone_seq_tokens: list[str] | None = None
+        phone_conf: float | None = None
+
+        if enable_phone_mode:
+            if self.phone_head is None:
+                raise ValueError(
+                    "enable_phone_mode=True but pipeline has no phone_head. "
+                    "Rebuild with build_pipeline(..., enable_phone_mode=True, phone_vocab_size=...)."
+                )
+            if "blank_id" not in self.phone_meta or "labels" not in self.phone_meta:
+                raise ValueError(
+                    "enable_phone_mode=True but phone_meta missing blank_id/labels."
+                )
+            blank_id = int(self.phone_meta["blank_id"])
+            labels = list(self.phone_meta["labels"])
+
+            self.phone_head.eval()
+            with torch.no_grad():
+                logits_phone = self.phone_head(E_t_tensor)  # (T, V)
+            phone_logits_np = logits_phone.cpu().numpy()
+            phone_ids_np, phone_seq_ids_np = decode_logits_greedy(
+                logits_phone,
+                blank_id=blank_id,
+                blank_bias=phone_blank_bias,
+                min_phone_conf=phone_min_conf if phone_min_conf > 0.0 else None,
+            )
+            phone_tokens = ids_to_tokens(phone_ids_np, labels)
+            phone_seq_tokens = ids_to_tokens(phone_seq_ids_np, labels)
+            phone_conf = confidence_from_logits(logits_phone)
+            print(
+                f"  phone mode   : T={len(phone_ids_np)}  U={len(phone_seq_ids_np)}  "
+                f"conf={phone_conf:.3f}"
+            )
 
         # 6. BeliefTransitionGRU
         B_np, pred_np, L_np = self.infer_beliefs(slots_tensor)
@@ -434,12 +548,25 @@ class SpeechWorldModelPipeline:
             mismatch     = mismatch,
             durations_ms = durations_ms,
             pooling      = self.pooling,
+            phone_logits = phone_logits_np,
+            phone_ids = phone_ids_np,
+            phone_sequence_ids = phone_seq_ids_np,
+            phone_tokens = phone_tokens,
+            phone_sequence_tokens = phone_seq_tokens,
+            phone_confidence = phone_conf,
             metadata     = {
-                "duration_s": waveform.shape[0] / sr,
-                "T":          T,
-                "K":          K,
-                "sr":         sr,
-                "utt_id":     utt_id,
+                "duration_s":    waveform.shape[0] / sr,
+                "T":             T,
+                "K":             K,
+                "sr":            sr,
+                "utt_id":        utt_id,
+                "mode":          mode,
+                "enable_phone_mode": enable_phone_mode,
+                "phone_blank_bias": phone_blank_bias,
+                "phone_min_conf": phone_min_conf,
+                "latency_ms":    source_latency_ms,
+                "source_wall_s": source_wall_s,
+                "source_config": source_config,
             },
         )
 
@@ -452,6 +579,10 @@ def build_pipeline(
     pooling:    Literal["mean", "attn"] = "mean",
     device:     torch.device | None     = None,
     cache_dir:  Path                    = CACHE_DIR,
+    enable_phone_mode: bool             = False,
+    phone_vocab_size: int | None        = None,
+    phone_meta: dict | None             = None,
+    phone_head_hidden_dim: int          = 0,
 ) -> SpeechWorldModelPipeline:
     """
     Instantiate all model components with random init weights and wrap in pipeline.
@@ -463,11 +594,23 @@ def build_pipeline(
     projector = EvidenceProjector(d_in=D_RAW, d_out=D_PROJ)
     slotizer: nn.Module = MeanPoolSlotizer() if pooling == "mean" else AttentionSlotizer(D_PROJ)
     belief_model = BeliefTransitionGRU(d=D_PROJ)
+    phone_head: PhoneCTCHead | None = None
+    if enable_phone_mode:
+        if phone_vocab_size is None:
+            raise ValueError("phone_vocab_size is required when enable_phone_mode=True")
+        hidden_dim = phone_head_hidden_dim if phone_head_hidden_dim > 0 else None
+        phone_head = PhoneCTCHead(
+            d_in=D_PROJ,
+            vocab_size=phone_vocab_size,
+            hidden_dim=hidden_dim,
+        )
 
     return SpeechWorldModelPipeline(
         projector    = projector,
         slotizer     = slotizer,
         belief_model = belief_model,
+        phone_head   = phone_head,
+        phone_meta   = phone_meta,
         pooling      = pooling,
         device       = device,
         cache_dir    = cache_dir,
