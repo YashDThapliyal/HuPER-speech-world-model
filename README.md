@@ -136,9 +136,9 @@ utterances). Belief smoothness stays well within the healthy range across all ut
 The model generalises to unseen utterances — prediction cosine of 0.785 on val vs. 0.851 on
 train confirms the representations are not utterance-specific.
 
-> **Active loss:** MSE next-slot prediction only.
-> **Placeholder:** Phone CTC and ASR CTC heads are scaffolded but not yet trained
-> (require labelled phone sequences and character-level transcripts — planned for Phase 8).
+> **Default loss:** MSE next-slot prediction.
+> **Optional phone mode:** frame-level phone CTC head on `E_t` with pseudo-label
+> supervision from a frozen teacher model.
 
 ---
 
@@ -181,7 +181,6 @@ CUDA has not been tested but should work with standard PyTorch device handling.
 git clone <this-repo>
 cd speech_world_model
 pip install -r requirements.txt
-pip install transformers>=4.36.0   # not in requirements.txt — install separately
 ```
 
 WavLM-Large (~1.2 GB) downloads automatically from HuggingFace on first run and is cached
@@ -204,9 +203,13 @@ WavLM layer-24 features are cached after the first run.
 ### Train on a LibriSpeech subset
 
 ```bash
-python3 train.py                           # default: 32 train + 8 val, 300 epochs max
+python3 train.py                           # default world-model objective only
 python3 train.py --train_n 64 --val_n 16   # larger split
 python3 train.py --epochs 500 --lr 5e-4    # custom schedule
+
+# Optional phone mode (CTC head on E_t with pseudo labels)
+python3 train.py --enable_phone_mode --phone_eval
+python3 train.py --enable_phone_mode --phone_loss_weight 2.0 --phone_eval
 ```
 
 WavLM features are extracted and cached to `data/cache/features/` on the first run.
@@ -241,10 +244,10 @@ python3 src/belief_model.py      # Phase 6 — single-utterance overfit
 
 ## Current Limitations
 
-- **Offline only.** All audio is loaded from disk before processing. There is no streaming
-  or incremental inference.
-- **Single active loss.** Only next-slot MSE prediction is trained. Phone CTC and ASR CTC
-  heads are scaffolded in `train.py` but commented as `[TODO Phase 8]`.
+- **Pseudo-streaming encoder.** Streaming inference is available, but uses windowed
+  WavLM rather than a natively causal backbone.
+- **Phone supervision is pseudo-labeled.** Phone mode currently learns from a frozen
+  teacher model, not human phone transcripts.
 - **No top-down feedback.** The `LanguagePriorHead` output `L_k` is computed but not yet
   fed back into the GRU as a top-down signal.
 - **Approximate syllable detection.** librosa onset detection is a reasonable proxy but
@@ -252,10 +255,31 @@ python3 src/belief_model.py      # Phase 6 — single-utterance overfit
   give more principled boundaries.
 - **Small training set.** Phase 7 used 32 train utterances. The model has not been evaluated
   at scale.
-- **WavLM-Large is batch-only.** The encoder runs on the full utterance at once; chunked
-  causal inference is not yet implemented.
+- **ASR head remains future work.** Character-level supervision on top of belief states
+  is not yet implemented in the main training loop.
 
 ---
+
+## Phone Mode + Streaming Commands
+
+Train phone mode:
+```bash
+python3 train.py --enable_phone_mode --phone_eval --train_n 8 --val_n 2 --epochs 2
+```
+
+Run phone inference from checkpoint:
+```bash
+python3 phone_infer.py --mode both --lookahead_ms 40
+# Optional decode tuning:
+python3 phone_infer.py --mode both --lookahead_ms 40 --blank_bias 0.2 --min_phone_conf 0.35
+```
+
+Evaluate phone mode:
+```bash
+python3 phone_mode_eval.py --n_utt 2 --lookahead_ms 40
+# Optional decode tuning:
+python3 phone_mode_eval.py --n_utt 8 --lookahead_ms 40 --blank_bias 0.2 --min_phone_conf 0.35
+```
 
 ## Next Direction: Streaming HuPER-Style Front End
 
