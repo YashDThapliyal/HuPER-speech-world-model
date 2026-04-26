@@ -11,6 +11,23 @@ build/
 data/samples/
 data/*.png
 data/*.jpg
+data/cache/
+data/checkpoints/
+data/figures_phase7/
+data/figures_phase8_final/*.png
+data/figures_phase8_final/*.json
+data/figures_phase8_final/sweeps/
+data/visualizations/
+data/cache/prod_eval_wavs/
+data/cache/phone_eval_wavs/
+data/figures_phase8_final/PHASE8_SLACK_UPDATE.md
+april11explanations/
+presentation/*.html
+presentation/
+2026-04-04-211119-this-session-is-being-continued-from-a-previous-c.txt
+progressupdates.md
+make_pipeline_diagram.py
+make_pipeline_diagram_v2.py
 
 # Models — downloaded from HuggingFace
 models/
