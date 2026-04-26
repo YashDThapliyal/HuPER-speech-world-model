@@ -1,15 +1,16 @@
-# Speech World Model — Offline HuPER-Inspired Prototype
+# Speech World Model — Streaming-Capable HuPER-Inspired Prototype
 
-An offline, learn-by-building implementation of a syllable-clocked belief propagation model
-for speech, inspired by the HuPER framework (arXiv:2602.01634).
+A learn-by-building implementation of a syllable-clocked belief propagation model
+for speech, inspired by the HuPER framework (arXiv:2602.01634), with integrated
+phone-mode training/inference/evaluation.
 
 Raw audio is passed through a frozen WavLM-Large encoder, projected into a compact acoustic
 evidence stream, segmented at the syllable level, and fed into a GRU-based belief model that
 learns to predict upcoming syllable slots — a concrete instantiation of the world-model
 objective applied to speech perception.
 
-> **This is an offline prototype.** All audio is processed in batch from disk. The
-> streaming/real-time front-end is the next development direction (see below).
+> **Current state:** offline + pseudo-streaming runtime paths are supported, and
+> the branch includes an integrated trainable phone mode with reproducible eval tooling.
 
 ---
 
@@ -79,7 +80,8 @@ Loss: MSE(Ŝ_{k+1}, S_{k+1})
       + monitor cosine(Ŝ_{k+1}, S_{k+1})
 ```
 
-**Total trainable parameters: 920,832**
+**Total trainable parameters: 920,832 (world-model core only)**
+**Phone mode adds:** `PhoneCTCHead` (~11,308 params with current vocab)
 Frozen backbone: WavLM-Large (315M)
 
 ---
@@ -89,15 +91,19 @@ Frozen backbone: WavLM-Large (315M)
 | Phase | Module | Description |
 |-------|--------|-------------|
 | 1 | `src/audio_explorer.py` | Audio loading, waveform/spectrogram visualisation, frame decomposition |
-| 2 | `src/phone_demo.py` | IPA phone recogniser (wav2vec2-TIMIT), CTC posteriors, blank-token analysis |
-| 2+ | `src/visualize.py` | Phone heatmap (44×T), blank timeline, single-word deep dive, CTC collapse table |
+| 2 | `src/phone_demo.py` | Legacy standalone phone demo (teacher posterior inspection and CTC collapse visuals) |
+| 2+ | `src/visualize.py` | Focused diagnostics and phone visualisations |
 | 3 | `src/huper_features.py` | WavLM-Large all-layer extraction, `EvidenceProjector`, phone-geometry PCA |
 | 4 | `src/syllable_clock.py` | Syllable boundary detection (onset-based, ~5 Hz), boundary visualisation |
 | 5 | `src/slotizer.py` | `MeanPoolSlotizer`, `AttentionSlotizer` with learnable query, compression plots |
 | 6 | `src/belief_model.py` | `BeliefTransitionGRU`, single-utterance overfit proof, 5 diagnostic figures |
-| 7 | `src/pipeline.py` | `SpeechWorldModelPipeline` end-to-end class with per-utterance feature caching |
-| 7 | `train.py` | Multi-utterance training on LibriSpeech with streaming + disk cache |
-| 7 | `verify.py` | Scientific verification: 5 diagnostic questions, 6 figures |
+| 7 | `src/pipeline.py` | Main runtime pipeline (offline + pseudo-streaming) with optional integrated phone decode |
+| 8 | `src/phone_ctc.py` | Phone teacher wrapper, pseudo-label cache, CTC loss/decode helpers, PER/edit-distance metrics |
+| 8 | `train.py` | World-model training with optional additive phone CTC objective (`--enable_phone_mode`) |
+| 8 | `phone_infer.py` | Phone inference CLI from checkpoint (offline/streaming/both, decode tuning presets) |
+| 8 | `phone_mode_eval.py` | Reproducible phone eval CLI with JSON artifacts and aggregate metrics |
+| 8 | `run_phone_mode_sweep.sh` | Checkpoint/lookahead/loss-weight sweep harness for operating-point search |
+| 8 | `verify.py` | Scientific verification for world-model behavior (non-phone diagnostics) |
 
 ---
 
@@ -140,34 +146,66 @@ train confirms the representations are not utterance-specific.
 > **Optional phone mode:** frame-level phone CTC head on `E_t` with pseudo-label
 > supervision from a frozen teacher model.
 
+### Phase 8 — Integrated phone mode (best validated operating point)
+
+Using checkpoint `data/checkpoints/phone_w20.pt` and tuned decode preset
+(`lookahead_ms=80`, `blank_bias=0.2`, `min_phone_conf=0.35`) on 20 validation utterances:
+
+| Metric | Value |
+|--------|-------|
+| Offline frame accuracy vs teacher | 0.6447 |
+| Streaming frame accuracy vs teacher | 0.3121 |
+| Offline PER vs teacher | 0.1563 |
+| Streaming PER vs teacher | 0.1785 |
+| Offline vs streaming sequence agreement | 0.8873 |
+| Streaming/offline sequence length ratio | 1.0132 |
+
+Interpretation:
+- Offline and streaming decoded phone sequences are closely matched at sequence level.
+- Streaming sequence lengths are stable (near 1.0 ratio), meaning decode behavior is not drifting.
+- Streaming frame-level token agreement is lower than offline, so near-term improvements should
+  focus on frame alignment under streaming constraints rather than sequence collapse behavior.
+
 ---
 
 ## Repository Structure
 
-```
+```text
 speech_world_model/
 ├── src/
 │   ├── audio_explorer.py     # Phase 1 — audio as data
-│   ├── phone_demo.py         # Phase 2 — phones and CTC
-│   ├── visualize.py          # Phase 2+ — focused phone visualisations
+│   ├── phone_demo.py         # Legacy standalone phone analysis demo
+│   ├── phone_ctc.py          # Phone teacher/pseudo-label/CTC/decode utilities
+│   ├── visualize.py          # Focused phone/world-model visual diagnostics
 │   ├── huper_features.py     # Phase 3 — WavLM hidden states + EvidenceProjector
+│   ├── feature_sources.py    # Shared feature source abstractions
+│   ├── streaming_encoder.py  # Pseudo-streaming WavLM feature extraction
 │   ├── syllable_clock.py     # Phase 4 — syllable boundary detection
 │   ├── slotizer.py           # Phase 5 — mean-pool and attention-pool slotizer
 │   ├── belief_model.py       # Phase 6 — BeliefTransitionGRU (core world model)
-│   └── pipeline.py           # Phase 7 — SpeechWorldModelPipeline with caching
-├── train.py                  # Phase 7 — multi-utterance training
-├── verify.py                 # Phase 7 — scientific verification + visualisations
+│   └── pipeline.py           # Main pipeline API (offline + pseudo-streaming + phone mode)
+├── train.py                  # Main training entrypoint (world model + optional phone mode)
+├── phone_infer.py            # Phone inference CLI from checkpoint
+├── phone_mode_eval.py        # Phone eval CLI with JSON outputs
+├── run_phone_mode_sweep.sh   # End-to-end sweep (loss weight x lookahead)
+├── verify.py                 # World-model verification + visualisations
+├── streaming_eval.py         # Streaming-focused eval helpers
+├── streaming_pipeline_eval.py
+├── production_wiring_eval.py
 ├── requirements.txt
-└── data/
-    ├── samples/              # librispeech_sample.wav (6.6s reference clip)
+├── data/
+    ├── samples/              # reference clips
     ├── cache/
-    │   ├── features/         # WavLM layer-24 tensors per utterance (.pt, gitignored)
-    │   └── boundaries/       # Syllable boundary lists per utterance (.pkl)
-    ├── checkpoints/          # belief_model_best.pt (gitignored)
-    ├── training_history.json # Per-epoch train/val loss and cosine
-    ├── figures_phase7/       # 6 verification figures
-    └── visualizations/
-        ├── phase1/ … phase6/ # Per-phase exploratory figures
+    │   ├── features/         # WavLM tensors per utterance (.pt, gitignored)
+    │   ├── boundaries/       # Syllable boundary lists (.pkl)
+    │   └── phone_labels/     # Cached teacher pseudo labels for phone mode
+    ├── checkpoints/          # best and sweep checkpoints (gitignored)
+    ├── figures_phase7/       # world-model verification figures
+    ├── figures_phase8_final/ # phone-mode eval JSON + reports
+    └── training_history.json # per-epoch logs
+└── docs/
+    ├── BRANCH_WORKFLOW.md
+    └── PHONE_MODE_SESSION_REPORT_2026-04-25.md/.pdf
 ```
 
 ---
@@ -190,31 +228,39 @@ by the `transformers` library under `~/.cache/huggingface/`.
 
 ## How to Run
 
-### Quick pipeline demo (one utterance, no training needed)
+### Quick world-model demo (one utterance, no training needed)
 
 ```bash
 python3 src/pipeline.py
 ```
 
-Runs the full pipeline on the included LibriSpeech sample using random-init weights.
+Runs the full world-model pipeline on the included LibriSpeech sample using random-init weights.
 Produces `data/figures_phase7/viz7_1_pipeline_overview.png`.
 WavLM layer-24 features are cached after the first run.
 
-### Train on a LibriSpeech subset
+### Train (world model only, default path)
 
 ```bash
 python3 train.py                           # default world-model objective only
 python3 train.py --train_n 64 --val_n 16   # larger split
 python3 train.py --epochs 500 --lr 5e-4    # custom schedule
-
-# Optional phone mode (CTC head on E_t with pseudo labels)
-python3 train.py --enable_phone_mode --phone_eval
-python3 train.py --enable_phone_mode --phone_loss_weight 2.0 --phone_eval
 ```
 
 WavLM features are extracted and cached to `data/cache/features/` on the first run.
 Subsequent runs load from cache — only the fast projector and GRU forward passes repeat
 each epoch. Best checkpoint saved to `data/checkpoints/belief_model_best.pt`.
+
+### Train with integrated phone mode (recommended settings)
+
+```bash
+# Current recommended phone-mode training setup
+python3 train.py --enable_phone_mode --phone_eval --phone_loss_weight 2.0 \
+  --train_n 32 --val_n 8 --epochs 40 --patience 10 --log_every 2
+```
+
+Notes:
+- On Apple Silicon, CTC may use CPU fallback while the rest stays on MPS.
+- Teacher pseudo-labels are cached under `data/cache/phone_labels/` for reuse.
 
 ### Verify a trained model
 
@@ -226,18 +272,24 @@ python3 verify.py --demo           # sanity-check pipeline without training
 Answers 5 diagnostic questions and generates all 6 verification figures under
 `data/figures_phase7/`.
 
-### Run individual phase demos
-
-Each module is self-contained and can be run directly. Each writes figures to
-`data/visualizations/phase{N}/`.
+### Phone-mode inference and eval CLIs
 
 ```bash
-python3 src/audio_explorer.py    # Phase 1 — waveform + spectrogram
-python3 src/phone_demo.py        # Phase 2 — phone posteriors + CTC
-python3 src/huper_features.py    # Phase 3 — WavLM layer comparison + PCA
-python3 src/syllable_clock.py    # Phase 4 — syllable boundaries
-python3 src/slotizer.py          # Phase 5 — slot compression
-python3 src/belief_model.py      # Phase 6 — single-utterance overfit
+# Inference (offline + streaming) using tuned preset by default
+python3 phone_infer.py --mode both
+
+# Explicit tuning controls
+python3 phone_infer.py --mode both --preset none --lookahead_ms 80 \
+  --blank_bias 0.2 --min_phone_conf 0.35
+
+# Eval (JSON report, tuned preset by default)
+python3 phone_mode_eval.py --ckpt data/checkpoints/phone_w20.pt --n_utt 20
+```
+
+### Sweep script (checkpoint + lookahead search)
+
+```bash
+./run_phone_mode_sweep.sh
 ```
 
 ---
@@ -255,33 +307,12 @@ python3 src/belief_model.py      # Phase 6 — single-utterance overfit
   give more principled boundaries.
 - **Small training set.** Phase 7 used 32 train utterances. The model has not been evaluated
   at scale.
-- **ASR head remains future work.** Character-level supervision on top of belief states
-  is not yet implemented in the main training loop.
+- **ASR text decoding not integrated.** The current recognizer outputs phone sequences; a
+  grapheme/word end-to-end path is a separate next milestone.
 
 ---
 
-## Phone Mode + Streaming Commands
-
-Train phone mode:
-```bash
-python3 train.py --enable_phone_mode --phone_eval --train_n 8 --val_n 2 --epochs 2
-```
-
-Run phone inference from checkpoint:
-```bash
-python3 phone_infer.py --mode both --lookahead_ms 40
-# Optional decode tuning:
-python3 phone_infer.py --mode both --lookahead_ms 40 --blank_bias 0.2 --min_phone_conf 0.35
-```
-
-Evaluate phone mode:
-```bash
-python3 phone_mode_eval.py --n_utt 2 --lookahead_ms 40
-# Optional decode tuning:
-python3 phone_mode_eval.py --n_utt 8 --lookahead_ms 40 --blank_bias 0.2 --min_phone_conf 0.35
-```
-
-## Next Direction: Streaming HuPER-Style Front End
+## Next Direction: Toward Fully Causal Real-Time
 
 Development continues on the `streaming-huper-encoder` branch. The goal is to replace the
 batch WavLM pipeline with a streaming acoustic-phonetic front end suitable for low-latency
@@ -290,8 +321,6 @@ and eventually real-time inference:
 - **Chunked feature extraction** — process audio in fixed-size causal windows without future
   context
 - **Online syllable detection** — boundary detection from a causal onset model
-- **Phone CTC head** — wire in phone prediction loss with labels from a pretrained phone
-  recogniser (wav2vec2-TIMIT or HuPER itself)
 - **ASR CTC head** — connect belief states to character-level CTC using LibriSpeech transcripts
   (transcripts are already available in the HuggingFace dataset stream)
 - **Incremental belief updates** — the GRU step is already causal; the bottleneck is the
